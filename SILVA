@@ -1,0 +1,319 @@
+/*--Instituto Federal de Educacao, Ciencia e Tecnologia do Ceara¡--
+ *                     --campus Maracanau--
+ *                 --Dispositivos Perifericos--
+ *
+ *--------- b0->Button +
+ *--------- b1->Button -
+ *--------- b2->Enter/Out
+ *
+ * Projeto por: Josyane da Silva Sampaio :: Matricula:20222045070132
+ *  
+ */
+ 
+#INCLUDE <18F4550.h>
+#device adc=10 //10bts -> 0 a 1023
+#FUSES NOPROTECT  //Habilita protecao ao codigo
+#FUSES MCLR       //Master Clear -Habilita a reinicilizacao do uC quando o MCLR for a 0V
+#FUSES HS         //Para trabalhar em altas frequencias
+#FUSES CPUDIV1    //Clock interno dividido por 1
+#FUSES NOWDT      //Watch Dog Timer - Habilita o WDT
+#FUSES PUT        //Power-Up Timer - uC tem delay de 66ms no reset, estabilizando seus perifericos e o sistema
+#FUSES BROWNOUT   //Brown-Out Reset (Quando a tensao cai abaixo do VBOR o uC reseta ate voltar ao normal) 
+//#FUSES BORV20     //Estabelece VBOR como 2.0V
+#FUSES NOLVP      //Low Voltage Programming - Desabilita, B3(PIC16) or B5(PIC18) used for I/O
+
+#use delay (clock=20MHz)
+#use rs232(baud=9600,xmit=pin_c6,rcv=pin_c7)
+
+/*
+#define LCD_TYPE 2 
+#include <LCD.c>
+*/
+
+//Define os pinos do LCD e biblioteca para placa PICGenius
+#define LCD_DB0   PIN_D0
+#define LCD_DB1   PIN_D1
+#define LCD_DB2   PIN_D2
+#define LCD_DB3   PIN_D3
+#define LCD_DB4   PIN_D4
+#define LCD_DB5   PIN_D5
+#define LCD_DB6   PIN_D6
+#define LCD_DB7   PIN_D7
+#define LCD_E     PIN_E1
+#define LCD_RS    PIN_E2
+#include <flex_lcd.c>
+
+//Fim das definicoes para lcd
+
+
+//#priority int_ext, int_timer0
+
+short flagOn      = 0; //Flag Para ligar planta
+short flagEnter   = 0; //Flag para Entrar ou sair do menu
+short flagPot     = 0; //Flag Potenciometro habilitado
+short flagTimer   = 0; //Flag para 1s
+short flagSerial  = 0; //Flag para habilitar saida serial
+const int16 st    = 3036; //Pr1=8 == Interrupcao de 0.1s
+unsigned int SP   = 50;//SetPoint
+int screen        = 0; //Controla apenas oq esta sendo mostrado no display
+int Operation     = 0; //Controla o que esta sendo ajustado
+int contTimer     = 0; //Conta o tempo da interrupcao para 1s
+int m             = 0; //unidade de milhar para protocolo
+int c             = 0; //unidade de centena para protocolo
+int d             = 0; //unidade de dezena para protocolo
+int u             = 0; //unidade para protocolo
+int pwmHeater     = 0; //PWM do motor ccp2 - aquecedor     //128
+int lastTemp      = 0; //Variavel auxiliar para controle derivativo
+int32 Temp        = 0; //Ad do LM convertido em Temperatura
+float LM          = 0.0; //Leitura do AD LM
+float pot         = 0.0; //potenciometro Ad read
+float error       = 0.0; //Erro medidor => SP-TEMP
+float Kp          = 1.8; //Constante proporcional
+float Ki          = 0.2; //Constante Integral
+float Kd          = 0.0; //Constante Derivativa
+float proportional= 0.0; //Valor proporcional
+float integral    = 0.0; //Valor integral
+float derivative  = 0.0; //Valor derivativo
+float PID         = 0.0; //Valor PID
+
+
+void Menu_LCD(); // Menu LCD
+void sendProtocol(); // Protocolo
+void PID_Control(); // Controlador PID
+
+#int_timer1
+void Temp_Counter()
+{ 
+   set_timer1(st+get_timer1());
+   contTimer++;
+   if(flagOn)
+   {
+     //output_bit(PIN_C5, 1); // aquecedor por resistor 
+     PID_Control();
+   }
+
+   if(contTimer==10)
+   {
+     flagTimer = 1;
+     contTimer = 0;  
+   }
+      
+}
+
+#int_EXT //botao b0
+void PlusButton()
+{
+     switch(Operation) //operação do menu
+     {
+       case 0: //mudar de tela
+         if(screen<4)
+         screen++;
+         else
+         screen = 0;
+         break;
+       case 1: //liga/desliga planta
+         flagOn =!flagOn;
+       case 2: //ajustar o setpoint -> acrescenta o setpoint
+         if(SP<100)
+            SP++;
+         else
+            SP=0;
+         break;
+       case 3: //habilita/desabilita potenciometro
+         flagPot =!flagPot;
+         break;
+       case 4:  //habilita/desabilita serial
+         flagSerial =!flagSerial;
+         break;
+       default:
+         break;
+      }
+  
+}
+#int_EXT1 //botao b1
+void MinusButton()
+{
+     switch(Operation)
+     {
+       case 0: //retornar as telas
+         if(screen>0)
+         screen--;
+         else
+         screen = 4;
+         break;
+       case 1: //liga/desliga planta
+         flagOn =!flagOn;
+       case 2: //ajustar o setpoint -> decrementar o setpoint
+         if(SP>0)
+            SP--;
+         else
+            SP=100;
+         break;
+      case 3: //habilita/desabilita potenciometro
+         flagPot =!flagPot;
+         break;
+      case 4: //habilita/desabilita protocolo
+         flagSerial =!flagSerial;
+         break;
+      default:
+         break;
+      }
+  
+}
+ 
+#int_EXT2 //botao b2
+void Op_Enter()
+{
+  if(!FlagEnter) // entra na configuração do menu escolhido
+  { 
+    Operation = screen;
+    flagEnter = 1;
+  }
+  else // confirma modificação e depois volta para o menu 
+  {
+    Operation = 0;
+    flagEnter = 0;
+  }
+}
+
+void main(){
+   
+   lcd_init();
+
+   setup_adc_ports(AN0_TO_AN2); //habilita saídas do ad -> pot e lm35
+   SETUP_ADC(ADC_CLOCK_INTERNAL);
+   
+   enable_interrupts(GLOBAL);
+   enable_interrupts(INT_timer1);
+   setup_timer_1(T1_INTERNAL|T1_DIV_BY_8); // padrao
+   setup_timer_2(T2_DIV_BY_4, 249, 1); //pwm
+   set_timer1(st); //time 
+   
+   //habilita int. externa. padrao -> 0 a 1 -> chama funçao (evita ruído e facilita devido não necessitar "chamar" função)
+   enable_interrupts(int_ext); //b0 -> #int_ext
+   enable_interrupts(int_ext1); //b1 -> #int_ext1
+   enable_interrupts(int_ext2); //b2 -> #int_ext2
+   
+   while(1)
+   {
+      SET_ADC_CHANNEL(2); //reconfigura LM
+      LM          = read_adc();
+      delay_ms(10);
+      Temp        = LM*0.488758;//igual a (5/1023)*100  
+      
+      set_pwm2_duty(pwmHeater); //seta valor do duty_cycle
+      setup_ccp2(CCP_PWM); //pino pic 18F ccp2 pwm (RC1) -p16
+      if(flagTimer) //1 em 1 segundo é acionado
+      {
+        Menu_LCD(); //atualiza os menus LCD a cada 1s
+        if(flagSerial)
+         sendProtocol(); // caso esteja habilitado, é enviado o protocolo do serial
+      }
+      
+      if(flagPot) //flagPot - idem lm35
+      {
+         SET_ADC_CHANNEL(0);
+         pot      = read_adc();
+         delay_ms(10);
+         SP        = pot*0.09775171;//igual a (100/1023) ->100º graus -> máx pot
+      }
+   }//while(1)
+   
+}//void main()
+
+void Menu_LCD() // trocar para Menu_LCD
+{
+     switch(screen)
+     {
+       case 0: //inicial, sem abertar botoes // mostra setpoint e temperatura
+         lcd_gotoxy(1,1);
+         printf(lcd_putc,"\fTemperatura: %lu%cC\r\n",Temp,0xdf);
+         lcd_gotoxy(1,2);
+         printf(lcd_putc,"SetPoint:    %u",SP);
+          break;
+         
+       case 1: //apertar botao b0 (+) -> tela 1 - ligar planta e verifica se está ligada ou desligada  (b2- enter)
+         lcd_gotoxy(1,1);
+         printf(lcd_putc,"\f1.Ligar Planta \r\n" );
+         lcd_gotoxy(1,2);
+         if(flagOn)
+         printf(lcd_putc,"      ON       ");
+         else
+         printf(lcd_putc,"      OFF       ");
+          break;
+          
+       case 2: //apertar botao b0 (+) -> tela 2 - mostra e ajusta set point (b2- enter)
+         lcd_gotoxy(1,1);
+         printf(lcd_putc,"\f2.Ajuste SP\r\n" );
+         lcd_gotoxy(1,2);
+         printf(lcd_putc,"        %u",SP);
+          break;
+          
+       case 3: //apertar botao b0 (+) -> tela 3 - habilita potenciometro (b2- enter)
+         lcd_gotoxy(1,1);
+         printf(lcd_putc,"\f3.Potenciometro \r\n" );
+         lcd_gotoxy(1,2);
+         if(flagPot)
+         printf(lcd_putc,"      ON       ");
+         else
+         printf(lcd_putc,"      OFF       ");
+          break;
+       case 4: //apertar botao b0 (+) -> tela 3 - saida serial - habilita serial (b2- enter)
+         lcd_gotoxy(1,1);
+         printf(lcd_putc,"\f4.Saida Serial\r\n" );
+         lcd_gotoxy(1,2);
+         if(flagSerial)
+         printf(lcd_putc,"      ON       ");
+         else
+         printf(lcd_putc,"      OFF       ");
+          break;
+          
+        default:
+         break;
+         // caso aperte novamente o b00, retorna para 0
+         //b1 -> caminho inverso
+         //b2 -> enter
+     }//switch
+     flagTimer = 0; 
+}//void useroutput()
+
+void sendProtocol()
+{
+   m= Temp/1000;
+   c=((Temp%1000)/100);
+   d=((Temp%1000)%100)/10;
+   u=(((Temp%1000)%100)%10)/1;
+   delay_ms(10);
+   //printf(" %f ",lux);
+   printf("&");
+   delay_ms(10);
+   printf("%d",m);
+   delay_ms(10);
+   printf("%d",c);
+   delay_ms(10);
+   printf("%d",d);
+   delay_ms(10);
+   printf("%d",u);
+   delay_ms(10);
+   printf("f");
+   delay_ms(10);
+   printf("f");
+   delay_ms(10);
+   printf("\r\n");
+   delay_ms(10);
+}
+void PID_Control()
+{
+    error           = SP - Temp;
+    proportional    = error * Kp;
+    integral       += error * Ki * 0.1; 
+    derivative      = ((lastTemp - Temp) * Kd) / 0.1;
+    lastTemp        = Temp;
+
+    PID             = proportional + integral + derivative;
+    PID             = PID/4; // Normalizacao ja que PWM e 8bits e o AD e 10bits - 10-8 = 2bits =4
+    pwmHeater       = PID; //+ 128;
+    if(pwmHeater>255)
+     pwmHeater=255;
+
+}
